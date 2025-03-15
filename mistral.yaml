@@ -1,0 +1,213 @@
+---
+- name: Install Mistral AI with FastAPI, Streamlit, Nginx (HTTPS) & API Key Authentication
+  hosts: all
+  become: true
+  vars:
+    python_version: "3.10"
+    mistral_model: "mistralai/Mistral-7B-v0.1"
+    install_path: "/opt/mistral"
+    api_host: "0.0.0.0"
+    api_port: 8000
+    ui_port: 8501
+    domain_name: "lab.e4it.com"  # Remplace par ton domaine
+    api_key: "xxxxxxxxx"  # À stocker dans un coffre-fort (ex: Vault)
+
+  tasks:
+    - name: Update package list (Debian-based)
+      apt:
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Install required dependencies
+      package:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - git
+          - wget
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    - name: Create installation directory
+      file:
+        path: "{{ install_path }}"
+        state: directory
+        owner: "{{ ansible_user | default('root') }}"
+        group: "{{ ansible_user | default('root') }}"
+        mode: '0755'
+
+    - name: Set up a Python virtual environment
+      command: python3 -m venv {{ install_path }}/venv
+      args:
+        creates: "{{ install_path }}/venv"
+
+    - name: Install required Python packages
+      pip:
+        virtualenv: "{{ install_path }}/venv"
+        name:
+          - torch
+          - torchvision
+          - torchaudio
+          - transformers
+          - accelerate
+          - huggingface_hub
+          - fastapi
+          - uvicorn
+          - streamlit
+
+    - name: Download and configure the Mistral model
+      shell: |
+        source {{ install_path }}/venv/bin/activate
+        python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
+                   AutoModelForCausalLM.from_pretrained('{{ mistral_model }}'); \
+                   AutoTokenizer.from_pretrained('{{ mistral_model }}')"
+      args:
+        creates: "{{ install_path }}/venv/lib/python{{ python_version }}/site-packages/transformers/models/mistral"
+
+    - name: Create the FastAPI script with API Key authentication
+      copy:
+        dest: "{{ install_path }}/api.py"
+        content: |
+          from fastapi import FastAPI, HTTPException, Header
+          from transformers import AutoModelForCausalLM, AutoTokenizer
+          import torch
+
+          app = FastAPI()
+
+          API_KEY = "{{ api_key }}"
+
+          model_name = "{{ mistral_model }}"
+          tokenizer = AutoTokenizer.from_pretrained(model_name)
+          model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
+
+          def authenticate(api_key: str = Header(None)):
+              if api_key != API_KEY:
+                  raise HTTPException(status_code=401, detail="Unauthorized")
+
+          @app.get("/")
+          def home():
+              return {"message": "Mistral AI API is running!"}
+
+          @app.post("/generate")
+          async def generate_text(prompt: str, api_key: str = Header(None)):
+              authenticate(api_key)
+              inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+              outputs = model.generate(**inputs, max_length=200)
+              text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+              return {"response": text}
+
+    - name: Create Streamlit UI script
+      copy:
+        dest: "{{ install_path }}/ui.py"
+        content: |
+          import streamlit as st
+          import requests
+
+          API_URL = "http://127.0.0.1:8000/generate"
+          API_KEY = "{{ api_key }}"
+
+          st.title("Mistral AI Chatbot")
+          prompt = st.text_input("Posez votre question :")
+
+          if st.button("Générer la réponse"):
+              response = requests.post(API_URL, json={"prompt": prompt}, headers={"api-key": API_KEY})
+              if response.status_code == 200:
+                  st.write(response.json()["response"])
+              else:
+                  st.error("Erreur API")
+
+    - name: Create a systemd service for FastAPI
+      copy:
+        dest: /etc/systemd/system/mistral-api.service
+        content: |
+          [Unit]
+          Description=Mistral LLM API Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart={{ install_path }}/venv/bin/uvicorn api:app --host {{ api_host }} --port {{ api_port }}
+          Restart=always
+          User=root
+          WorkingDirectory={{ install_path }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create a systemd service for Streamlit UI
+      copy:
+        dest: /etc/systemd/system/mistral-ui.service
+        content: |
+          [Unit]
+          Description=Streamlit Mistral UI Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart={{ install_path }}/venv/bin/streamlit run {{ install_path }}/ui.py --server.port {{ ui_port }}
+          Restart=always
+          User=root
+          WorkingDirectory={{ install_path }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Mistral API service
+      systemd:
+        name: mistral-api
+        enabled: yes
+        state: started
+
+    - name: Enable and start Mistral UI service
+      systemd:
+        name: mistral-ui
+        enabled: yes
+        state: started
+
+    - name: Configure Nginx
+      copy:
+        dest: /etc/nginx/sites-available/mistral
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+
+              location / {
+                  proxy_pass http://127.0.0.1:8501;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location /api/ {
+                  proxy_pass http://127.0.0.1:8000/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/mistral
+        dest: /etc/nginx/sites-enabled/mistral
+        state: link
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    - name: Obtain SSL Certificate
+      command: certbot --nginx -d {{ domain_name }} --non-interactive --agree-tos -m admin@{{ domain_name }}
+
